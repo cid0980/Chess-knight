@@ -5,21 +5,23 @@ import Pusher from 'pusher-js';
 import {
   AlertTriangle, ArrowLeft, ArrowRight, Bell, Check, CheckCheck, ChevronDown, ChevronRight,
   Clock3, Copy, Crown, Flag, Handshake, History, Inbox, KeyRound, LoaderCircle, LockKeyhole,
-  MessageCircle, MoveUpRight, Play, Plus, Radio, RotateCcw, Search, Send, Settings, Shield,
-  Share2, Smartphone, Sparkles, Swords, Timer, Trophy, UserPlus, UsersRound, Volume2, VolumeX, Wifi, WifiOff, X,
+  MessageCircle, Monitor, Moon, MoveUpRight, Play, Plus, Radio, RotateCcw, Search, Send, Settings, Shield,
+  Share2, Smartphone, Sparkles, Sun, Swords, Timer, Trophy, UserPlus, UsersRound, Volume2, VolumeX, Wifi, WifiOff, X,
 } from 'lucide-react';
 import { Chess, type Square } from 'chess.js';
-import ChessBoard, { type BoardArrow } from '@/components/ChessBoard';
+import ChessBoard from '@/components/ChessBoard';
 import { canonicalJson } from '@/lib/canonical-json';
+import { applyRelayedSnapshot, mateInfoFromFen, positionVerdict, reconcileGameSnapshot, winnerIdFor, type MateInfo } from '@/lib/chess-state';
 import type { FriendRecord, FriendRequest, GameAction, GameActionType, GameMove, GameRecord, PlayerProfile, ToastMessage } from '@/lib/types';
 
 type Tab = 'play' | 'friends' | 'inbox' | 'history' | 'settings';
 type Runtime = 'loading' | 'local' | 'live';
 type BoardTheme = 'classic' | 'wood' | 'slate';
+type ThemePreference = 'system' | 'light' | 'dark';
 type Premove = { from: string; to: string; promotion?: string };
 type PendingChallenge = { id: string; from: PlayerProfile; game: GameRecord; created_at: string };
 type RematchRequest = { fromId: string; game: GameRecord };
-type LocalPreferences = { boardTheme: BoardTheme; coordinates: boolean; sound: boolean; notifications: boolean };
+type LocalPreferences = { boardTheme: BoardTheme; theme: ThemePreference; coordinates: boolean; sound: boolean; notifications: boolean };
 type DeviceLock = { salt: string; hash: string };
 type PusherClient = InstanceType<typeof Pusher>;
 type RelayChannel = ReturnType<PusherClient['subscribe']>;
@@ -30,7 +32,7 @@ const PREFS_KEY = 'knightclub:v2:preferences';
 const LOCK_KEY = 'knightclub:v2:device-lock';
 const ACTIVE_GAME_KEY = 'knightclub:active-game';
 const PRESENCE_CHANNEL = 'presence-knightclub-v1';
-const DEFAULT_PREFS: LocalPreferences = { boardTheme: 'classic', coordinates: true, sound: true, notifications: false };
+const DEFAULT_PREFS: LocalPreferences = { boardTheme: 'classic', theme: 'system', coordinates: true, sound: true, notifications: false };
 const TIME_OPTIONS = [
   { label: '3 min', seconds: 180, increment: 0, name: 'Blitz' },
   { label: '5 min', seconds: 300, increment: 0, name: 'Blitz' },
@@ -218,19 +220,10 @@ function decodeGameSnapshot(value: unknown): GameRecord | null {
   return isValidGame(decoded) ? decoded : null;
 }
 
-function mateInfo(game: GameRecord | null): { king: string; arrows: BoardArrow[]; attackers: string[] } | null {
-  if (!game || game.status !== 'checkmate') return null;
-  try {
-    const chess = new Chess(game.fen);
-    const kingColor = chess.turn();
-    const board = chess.board();
-    const row = board.findIndex((rank) => rank.some((piece) => piece?.type === 'k' && piece.color === kingColor));
-    if (row < 0) return null;
-    const col = board[row].findIndex((piece) => piece?.type === 'k' && piece.color === kingColor);
-    const king = `${'abcdefgh'[col]}${8 - row}`;
-    const attackers = chess.attackers(king as Square, kingColor === 'w' ? 'b' : 'w');
-    return { king, attackers, arrows: attackers.map((from) => ({ from, to: king, color: '#d65d4f' })) };
-  } catch { return null; }
+function boardMateInfo(game: GameRecord | null): MateInfo | null {
+  if (!game) return null;
+  // Derived from the actual board, not from a status flag that a stale snapshot may carry.
+  return mateInfoFromFen(game.fen);
 }
 
 function allMoves(game: GameRecord) {
@@ -264,16 +257,49 @@ async function signRelayEnvelope(secret: string, envelope: Record<string, unknow
   return Array.from(new Uint8Array(signature), (value) => value.toString(16).padStart(2, '0')).join('');
 }
 
+// One shared audio context for the whole session. Creating a new context per move
+// hits the browser's context limit and never plays while it is still suspended,
+// which is why the first relayed move used to be silent.
+let moveAudioContext: AudioContext | null = null;
+
+function sharedAudioContext(): AudioContext | null {
+  if (typeof window === 'undefined') return null;
+  if (moveAudioContext) return moveAudioContext;
+  const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!Ctor) return null;
+  try { moveAudioContext = new Ctor(); } catch { moveAudioContext = null; }
+  return moveAudioContext;
+}
+
+/** Called from a real user gesture so the context is running before the first relayed move. */
+function unlockMoveAudio() {
+  const audio = sharedAudioContext();
+  if (audio && audio.state === 'suspended') void audio.resume().catch(() => { /* Audio stays optional. */ });
+}
+
 function playMoveTone(enabled: boolean) {
-  if (!enabled || typeof window === 'undefined') return;
-  try {
-    const audio = new window.AudioContext();
-    const oscillator = audio.createOscillator();
-    const gain = audio.createGain();
-    oscillator.type = 'sine'; oscillator.frequency.value = 540; gain.gain.value = 0.035;
-    oscillator.connect(gain); gain.connect(audio.destination); oscillator.start(); oscillator.stop(audio.currentTime + 0.055);
-    window.setTimeout(() => void audio.close(), 150);
-  } catch { /* Audio is optional. */ }
+  if (!enabled) return;
+  const audio = sharedAudioContext();
+  if (!audio) return;
+  const play = () => {
+    try {
+      const oscillator = audio.createOscillator();
+      const gain = audio.createGain();
+      oscillator.type = 'sine';
+      oscillator.frequency.value = 540;
+      oscillator.connect(gain); gain.connect(audio.destination);
+      gain.gain.setValueAtTime(0.035, audio.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + 0.07);
+      oscillator.start();
+      oscillator.stop(audio.currentTime + 0.06);
+      oscillator.onended = () => { try { gain.disconnect(); } catch { /* Already detached. */ } };
+    } catch { /* Audio is optional. */ }
+  };
+  if (audio.state === 'suspended') {
+    void audio.resume().then(play).catch(() => { /* Browsers may keep audio locked until a gesture. */ });
+    return;
+  }
+  play();
 }
 
 export default function ChessClubApp() {
@@ -369,7 +395,12 @@ export default function ChessClubApp() {
       let storedGame: GameRecord | null = null;
       try {
         const candidate = JSON.parse(sessionStorage.getItem(ACTIVE_GAME_KEY) || 'null');
-        if (isValidGame(candidate) && candidate.status === 'active' && !candidate.localOnly && [candidate.white_id, candidate.black_id].includes(storedProfile.id)) storedGame = candidate;
+        // A restored snapshot is re-read from its board so a stored game that ended
+        // while this tab was away does not come back as if it were still running.
+        if (isValidGame(candidate) && !candidate.localOnly && [candidate.white_id, candidate.black_id].includes(storedProfile.id)) {
+          const stored = reconcileGameSnapshot(candidate).game;
+          if (stored.status === 'active') storedGame = stored;
+        }
       } catch { /* No local active match. */ }
       if (cancelled) return;
       setProfile(storedProfile);
@@ -404,6 +435,41 @@ export default function ChessClubApp() {
     }
     try { sessionStorage.setItem(ACTIVE_GAME_KEY, JSON.stringify(currentGame)); } catch { /* Session storage is optional. */ }
   }, [currentGame]);
+
+  useEffect(() => {
+    // `theme` resolves to the OS preference, to light, or to dark; the same value is
+    // written to the document element and to the browser theme-color meta tag.
+    const root = document.documentElement;
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const applyTheme = () => {
+      const resolved = preferences.theme === 'system' ? (media.matches ? 'dark' : 'light') : preferences.theme;
+      root.dataset.theme = resolved;
+      root.style.colorScheme = resolved;
+      document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => {
+        meta.setAttribute('content', resolved === 'dark' ? '#0e1512' : '#f3f4f0');
+      });
+    };
+    applyTheme();
+    media.addEventListener('change', applyTheme);
+    return () => media.removeEventListener('change', applyTheme);
+  }, [preferences.theme]);
+
+  useEffect(() => {
+    // Audio can only be unlocked from a real gesture, so do it on the first
+    // interaction instead of when the first relayed move arrives.
+    const unlock = () => unlockMoveAudio();
+    window.addEventListener('pointerdown', unlock, { once: true, passive: true });
+    window.addEventListener('keydown', unlock, { once: true });
+    window.addEventListener('touchstart', unlock, { once: true, passive: true });
+    const onVisibility = () => { if (document.visibilityState === 'visible') unlockMoveAudio(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+      window.removeEventListener('touchstart', unlock);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, []);
 
   const addKnownPlayer = useCallback((player: PlayerProfile) => {
     setKnownPlayers((current) => ({ ...current, [player.id]: player }));
@@ -569,14 +635,21 @@ export default function ChessClubApp() {
       const current = currentGameRef.current;
       const incoming = decodeGameSnapshot(data?.game);
       if (!current || !incoming || incoming.id !== current.id || data.fromId === profileRef.current?.id) return;
-      if (incoming.version <= current.version) return;
       if (![current.white_id, current.black_id].includes(data.fromId || '')) return;
       const validPgn = (() => { try { safeChess(incoming); return true; } catch { return false; } })();
       if (!validPgn) return;
-      setCurrentGame(incoming); currentGameRef.current = incoming;
-      setGames((previous) => upsertGame(previous, incoming));
+      // Final results survive version collisions, and a snapshot that is behind its
+      // own board is corrected before it is stored and echoed back to the sender.
+      const application = applyRelayedSnapshot(current, incoming, { fromId: data.fromId || '', localPlayerId: profileRef.current?.id || '' });
+      if (!application.accepted) return;
+      const applied = application.game;
+      setCurrentGame(applied); currentGameRef.current = applied;
+      setGames((previous) => upsertGame(previous, applied));
       setSelectedSquare(null); setLegalTargets([]); setPromotion(null);
-      if (preferencesRef.current.sound && incoming.moves_count > current.moves_count) playMoveTone(true);
+      if (applied.status !== 'active') setQueuedPremove(null);
+      if (preferencesRef.current.sound && application.sound) playMoveTone(true);
+      if (application.finished) notify(applied.status === 'checkmate' ? 'Checkmate. The game is over.' : 'The game ended in a draw.', 'success');
+      if (application.rebroadcast) broadcastSnapshot(applied);
     };
     const onSyncRequest = (data: { fromId?: string; version?: number }) => {
       const latest = currentGameRef.current;
@@ -663,6 +736,42 @@ export default function ChessClubApp() {
   }, [notify, sendGameSnapshot, updateGame]);
 
   useEffect(() => {
+    // Self-heal: a locally stored snapshot can still say "active" while its board is
+    // already checkmate, stalemate or a draw. Finalize it and tell the opponent.
+    const game = currentGame;
+    if (!game || game.status !== 'active') return;
+    const { game: corrected, corrected: wasCorrected } = reconcileGameSnapshot(game);
+    if (!wasCorrected) return;
+    updateGame(corrected);
+    setQueuedPremove(null);
+    setSelectedSquare(null);
+    setLegalTargets([]);
+    setPromotion(null);
+    if (!game.localOnly) sendGameSnapshot(corrected);
+    notify(corrected.status === 'checkmate' ? 'Checkmate. The game is over.' : 'The game ended in a draw.', 'success');
+  }, [currentGame, notify, sendGameSnapshot, updateGame]);
+
+  useEffect(() => {
+    // Recover a missed snapshot after a reconnect or when the tab wakes up again.
+    const client = pusherClient;
+    const game = currentGame;
+    if (!client || !game || game.localOnly || game.status !== 'active') return;
+    const requestSync = () => {
+      const channel = client.channel(`private-game-${game.id}`);
+      if (channel?.subscribed) channel.trigger('client-sync-request', { fromId: profileRef.current?.id, version: currentGameRef.current?.version || 0 });
+    };
+    const onVisibility = () => { if (document.visibilityState === 'visible') requestSync(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('online', requestSync);
+    client.connection.bind('connected', requestSync);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('online', requestSync);
+      client.connection.unbind('connected', requestSync);
+    };
+  }, [pusherClient, currentGame?.id, currentGame?.localOnly, currentGame?.status]);
+
+  useEffect(() => {
     const id = window.setInterval(() => {
       const game = currentGameRef.current;
       if (!game || game.status !== 'active') return;
@@ -682,12 +791,25 @@ export default function ChessClubApp() {
     const game = currentGame;
     if (!game || game.status !== 'active' || game.localOnly || game.turn_user_id !== profile?.id || !queuedPremove) return;
     const premove = queuedPremove;
-    setQueuedPremove(null);
-    const id = window.setTimeout(() => commitMove(premove.from, premove.to, premove.promotion || 'q'), 40);
+    // The premove stays queued (and visible) until the scheduled move is actually
+    // committed, so a re-render or a clock tick cannot drop it on the floor.
+    const id = window.setTimeout(() => {
+      commitMove(premove.from, premove.to, premove.promotion || 'q');
+      setQueuedPremove((current) => (current && current.from === premove.from && current.to === premove.to ? null : current));
+    }, 40);
     return () => window.clearTimeout(id);
     // commitMove intentionally reads the latest game snapshot through a ref.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentGame?.turn_user_id, currentGame?.version, profile?.id, queuedPremove]);
+
+  useEffect(() => {
+    // Premoves and selections are meaningless once play has ended.
+    if (!currentGame || currentGame.status === 'active') return;
+    setQueuedPremove(null);
+    setSelectedSquare(null);
+    setLegalTargets([]);
+    setPromotion(null);
+  }, [currentGame?.status, currentGame?.id]);
 
   const saveGameLocally = useCallback((game: GameRecord) => {
     currentGameRef.current = game;
@@ -725,10 +847,8 @@ export default function ChessClubApp() {
     if (game.turn_user_id === game.white_id) whiteClock += game.increment_seconds * 1000;
     else blackClock += game.increment_seconds * 1000;
     const nextTurn = chess.turn() === 'w' ? game.white_id : game.black_id;
-    const mate = chess.isCheckmate();
-    const stalemate = chess.isStalemate();
-    const draw = chess.isDraw();
-    const status: GameRecord['status'] = mate ? 'checkmate' : stalemate ? 'stalemate' : draw ? 'draw' : 'active';
+    const verdict = positionVerdict(chess.fen());
+    const status: GameRecord['status'] = verdict?.status ?? 'active';
     const nowIso = new Date().toISOString();
     const move: GameMove = {
       from_square: played.from, to_square: played.to, promotion: played.promotion || null, san: played.san,
@@ -739,8 +859,8 @@ export default function ChessClubApp() {
       ...game, fen: chess.fen(), pgn: chess.pgn(), turn_user_id: status === 'active' ? nextTurn : null,
       white_clock_ms: whiteClock, black_clock_ms: blackClock, turn_started_at: status === 'active' ? nowIso : null,
       started_at: game.started_at || nowIso, finished_at: status === 'active' ? null : nowIso,
-      winner_id: mate ? game.turn_user_id : null,
-      result_reason: mate ? 'checkmate' : stalemate ? 'stalemate' : draw ? 'draw' : null,
+      winner_id: verdict ? winnerIdFor(game, verdict) : null,
+      result_reason: verdict?.result_reason ?? null,
       moves_count: game.moves_count + 1, version: game.version + 1,
       last_move: { from: played.from, to: played.to, san: played.san },
       moves: [...(game.moves || []), move],
@@ -870,7 +990,7 @@ export default function ChessClubApp() {
   function respondToGameAction(actionId: string, accepted: boolean) {
     const game = currentGameRef.current;
     const player = profileRef.current;
-    if (!game || !player) return;
+    if (!game || !player || game.status !== 'active') return;
     const action = (game.actions || []).find((item) => item.id === actionId);
     if (!action) return;
     let updated: GameRecord = { ...game, actions: (game.actions || []).map((item) => item.id === actionId ? { ...item, status: accepted ? 'accepted' : 'rejected' } : item), version: game.version + 1 };
@@ -984,12 +1104,12 @@ export default function ChessClubApp() {
   const currentOpponentId = currentGame && profile ? (currentGame.white_id === profile.id ? currentGame.black_id : currentGame.white_id) : '';
   const opponent = currentOpponentId ? (friends.find((friend) => friend.id === currentOpponentId) || knownPlayers[currentOpponentId] || { id: currentOpponentId, public_id: '', friend_code: '', username: 'opponent', display_name: currentGame?.localOnly ? 'Practice partner' : 'KnightClub player' }) : null;
   const gameMoves = currentGame ? allMoves(currentGame) : [];
-  const mate = mateInfo(currentGame);
+  const mate = boardMateInfo(currentGame);
   const boardFen = currentGame ? (replayOpen ? fenAfterMoves(gameMoves, replayIndex) : currentGame.fen) : INITIAL_FEN;
   const displayClocks = currentGame ? clocksFor(currentGame, now) : { white: 0, black: 0 };
   const isMyTurn = Boolean(currentGame && profile && currentGame.turn_user_id === profile.id);
   const gameColor = currentGame && profile ? (currentGame.white_id === profile.id ? 'w' : 'b') : 'w';
-  const activeAction = currentGame?.actions?.find((action) => action.status === 'pending');
+  const activeAction = currentGame?.status === 'active' ? currentGame.actions?.find((action) => action.status === 'pending') : undefined;
   const incomingForMe = activeAction?.recipient_id === profile?.id;
   const outgoingForMe = activeAction?.requester_id === profile?.id;
 
@@ -1250,7 +1370,7 @@ function SettingsPage({ profile, runtime, connected, preferences, onPreferences,
   return <><div className="page-heading-row"><div><span className="eyebrow">YOUR KNIGHTCLUB</span><h1>Settings</h1><p className="muted">Everything here stays in this browser unless it’s a live game event.</p></div><span className="connection-pill"><i className="connection-dot" />{connected ? 'Relay online' : runtime === 'live' ? 'Relay reconnecting' : 'Local-only mode'}</span></div>
     <div className="settings-layout"><div className="settings-main">
       <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><UsersRound size={15} /></span><div><h2>Browser profile</h2><p>No account, email, or server-side profile.</p></div></div><form className="settings-form" onSubmit={onSaveName}><label><span>Display name</span><input value={displayName} onChange={(event) => onDisplayName(event.target.value)} maxLength={32} placeholder="How friends see you" /></label><label><span>Username</span><input value={profile?.username || ''} readOnly /></label><div className="settings-form-actions"><small>Saved to this device only.</small><button className="button button-primary button-compact" type="submit"><Check size={12} /> Save name</button></div></form><div className="your-friend-code"><div><small>YOUR ONE-TIME FRIEND CODE</small><strong>{profile?.friend_code}</strong><span>Share privately with someone you want to add.</span></div><button className="button button-outline button-compact" onClick={onCopyCode}><Copy size={12} /> Copy code</button></div></section>
-      <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><Settings size={15} /></span><div><h2>Board & sound</h2><p>These preferences are stored in local browser storage.</p></div></div><div className="setting-select-row"><span><strong>Board theme</strong><small>Choose a board palette</small></span><div className="theme-options"><button className={`theme-swatch${preferences.boardTheme === 'classic' ? ' theme-swatch-active' : ''}`} aria-label="Classic board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'classic' }))}><i /></button><button className={`theme-swatch theme-swatch-wood${preferences.boardTheme === 'wood' ? ' theme-swatch-active' : ''}`} aria-label="Wood board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'wood' }))}><i /></button><button className={`theme-swatch theme-swatch-slate${preferences.boardTheme === 'slate' ? ' theme-swatch-active' : ''}`} aria-label="Slate board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'slate' }))}><i /></button></div></div><SettingToggle title="Board coordinates" detail="Show file and rank labels around the board" checked={preferences.coordinates} onChange={() => onPreferences((current) => ({ ...current, coordinates: !current.coordinates }))} /><SettingToggle title="Move sounds" detail="Play a short tone after a move" checked={preferences.sound} onChange={() => onPreferences((current) => ({ ...current, sound: !current.sound }))} /></section>
+      <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><Settings size={15} /></span><div><h2>Appearance, board & sound</h2><p>These preferences are stored in local browser storage.</p></div></div><div className="setting-select-row"><span><strong>Appearance</strong><small>Follow this device or pin a theme</small></span><div className="appearance-options" role="group" aria-label="Appearance">{([['system', 'System', Monitor], ['light', 'Light', Sun], ['dark', 'Dark', Moon]] as const).map(([value, label, Icon]) => <button key={value} type="button" aria-pressed={preferences.theme === value} className={`appearance-choice${preferences.theme === value ? ' appearance-choice-active' : ''}`} onClick={() => onPreferences((current) => ({ ...current, theme: value }))}><Icon size={12} />{label}</button>)}</div></div><div className="setting-select-row"><span><strong>Board theme</strong><small>Choose a board palette</small></span><div className="theme-options"><button className={`theme-swatch${preferences.boardTheme === 'classic' ? ' theme-swatch-active' : ''}`} aria-label="Classic board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'classic' }))}><i /></button><button className={`theme-swatch theme-swatch-wood${preferences.boardTheme === 'wood' ? ' theme-swatch-active' : ''}`} aria-label="Wood board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'wood' }))}><i /></button><button className={`theme-swatch theme-swatch-slate${preferences.boardTheme === 'slate' ? ' theme-swatch-active' : ''}`} aria-label="Slate board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'slate' }))}><i /></button></div></div><SettingToggle title="Board coordinates" detail="Show file and rank labels around the board" checked={preferences.coordinates} onChange={() => onPreferences((current) => ({ ...current, coordinates: !current.coordinates }))} /><SettingToggle title="Move sounds" detail="Play a short tone after a move" checked={preferences.sound} onChange={() => onPreferences((current) => ({ ...current, sound: !current.sound }))} /></section>
       <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><Bell size={15} /></span><div><h2>Notifications</h2><p>Browser notifications work only while this page is open and connected.</p></div></div><SettingToggle title="Incoming challenges" detail="Ask the browser for permission to show live challenge alerts" checked={preferences.notifications} onChange={() => preferences.notifications ? onPreferences((current) => ({ ...current, notifications: false })) : onEnableNotifications()} /><div className="settings-note"><AlertTriangle size={13} />This is not offline push. No service stores or queues notifications while you are away.</div></section>
       <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><LockKeyhole size={15} /></span><div><h2>Local device lock</h2><p>Optional browser-only lock; it is not an account password.</p></div></div><form className="password-form" onSubmit={onSaveLock}>{deviceLock && <label className="local-password-field"><span className="field-label">Current local lock</span><input type="password" value={currentPassword} onChange={(event) => onCurrentPassword(event.target.value)} autoComplete="current-password" /></label>}<div className="local-lock-grid"><label className="local-password-field"><span className="field-label">{deviceLock ? 'New password (blank removes lock)' : 'New local password'}</span><input type="password" value={newPassword} onChange={(event) => onNewPassword(event.target.value)} autoComplete="new-password" placeholder="At least 8 characters" /></label><label className="local-password-field"><span className="field-label">Confirm password</span><input type="password" value={confirmPassword} onChange={(event) => onConfirmPassword(event.target.value)} autoComplete="new-password" /></label></div><div className="settings-form-actions"><small>Clearing browser data removes this lock and local profile.</small><button className="button button-outline button-compact" type="submit"><KeyRound size={12} /> {deviceLock ? 'Update local lock' : 'Set local lock'}</button></div></form><div className="settings-note"><Shield size={13} />No password leaves this device. There is no server account, sync, or password recovery.</div></section>
     </div><aside className="settings-side-column"><div className="deployment-card"><span className="deploy-badge"><i className="deploy-badge-dot" /> {runtime === 'live' ? 'LIVE RELAY' : 'VERCEL READY'}</span><h2>Zero-database<br />by design.</h2><p>Vercel hosts the app and a tiny signed-channel authorization route. Pusher forwards live events; it is not used as a database.</p><ul><li><Check size={13} /> Friends & settings stay local</li><li><Check size={13} /> Both players online for requests</li><li><Check size={13} /> No durable inbox or history</li><li><Check size={13} /> No offline push delivery</li></ul><span className="deploy-doc-link">{connected ? 'Connected to Pusher Channels' : 'See README for Pusher setup'}</span></div><div className="privacy-card"><Shield size={15} /><div><strong>Capability-code privacy</strong><p>Your friend code is a secret bearer invite. Share it only with people you trust; anyone who has it can address your live inbox.</p></div></div><div className="privacy-card"><Wifi size={15} /><div><strong>Connection status</strong><p>{connected ? 'Your browser is connected. Direct requests can be exchanged while your friends are online.' : 'The board works locally. Add Pusher credentials and enable client events to play online.'}</p></div></div></aside></div>
@@ -1262,7 +1382,7 @@ function SettingToggle({ title, detail, checked, onChange }: { title: string; de
 }
 
 function GameRoom({ game, player, opponent, boardFen, mate, theme, coordinates, selectedSquare, legalTargets, premove, disabled, replayOpen, replayIndex, replayTotal, clocks, isMyTurn, gameColor, activeAction, incomingForMe, outgoingForMe, rematchIncoming, rematchWaiting, onBack, onSquareClick, onMoveDrop, onDragSelect, onCancelPremove, onPromotion, promotion, onCancelPromotion, onResign, resignConfirm, onToggleResign, onOfferDraw, onTakeback, onRespondAction, onRematch, onAnswerRematch, onReplay, onReplayIndex, onCloseReplay, onNewGame }: {
-  game: GameRecord; player: PlayerProfile; opponent: PlayerProfile & { online?: boolean }; boardFen: string; mate: ReturnType<typeof mateInfo>;
+  game: GameRecord; player: PlayerProfile; opponent: PlayerProfile & { online?: boolean }; boardFen: string; mate: MateInfo | null;
   theme: BoardTheme; coordinates: boolean; selectedSquare: string | null; legalTargets: string[]; premove: Premove | null; disabled: boolean;
   replayOpen: boolean; replayIndex: number; replayTotal: number; clocks: { white: number; black: number }; isMyTurn: boolean; gameColor: 'w' | 'b';
   activeAction?: GameAction; incomingForMe: boolean; outgoingForMe: boolean; rematchIncoming: RematchRequest | null; rematchWaiting: boolean;

@@ -5,11 +5,14 @@ A polished, Vercel-hostable chess club for live games with friends. Friends and 
 ## What’s included
 
 - Direct, in-app friend requests and game challenges using a one-time friend code—no repeatedly shared match links.
-- Legal-move highlights, click and drag moves, promotion choices, premoves, and cancel-premove.
+- Legal-move highlights, click and drag moves, promotion choices, premoves, and cancel-premove. A queued premove stays visible until the move is actually committed, then it is executed or discarded with a notice.
 - Clocks, takeback requests, draw offers, resign, rematch with swapped colors, and move replay.
-- Checkmate explanation with arrows pointing from checking pieces toward the trapped king.
-- Local board, sound, notification, display-name, and optional browser-lock settings.
-- Responsive, installable PWA for Vercel/Next.js, with mobile install guidance and a lightweight app-shell cache.
+- Checkmate explanation with arrows derived from the actual position: the checking lines are read from the board, not from a stored flag.
+- Final results are agreed between the two clients. A snapshot that still says “active” while its board is checkmate, stalemate or a draw is corrected, stored, and echoed back to the sender, so both players see the same ending even when a relay event was missed or two versions collided.
+- Light, dark, and “follow this device” appearance settings, applied before first paint so a dark reload never flashes white. Board coordinates, move-sound and notification toggles live next to it.
+- Move sounds share a single resumed audio context that is unlocked on the first tap or key press, so the first relayed move is audible.
+- Display name, friend code, and an optional browser-local lock, managed from the settings page.
+- Responsive, installable PWA for Vercel/Next.js, with mobile install guidance, a dark-aware offline page, and a lightweight app-shell cache.
 
 ## Zero-database architecture and tradeoffs
 
@@ -75,12 +78,24 @@ The app uses presence to show which saved friends are online. A friend request o
 ## Commands
 
 ```bash
-npm run dev      # local development
-npm run lint     # TypeScript check
-npm run build    # production build
-npm start        # run the built app locally
-npm audit        # dependency security audit
+npm run dev        # local development
+npm run lint       # TypeScript check
+npm test           # game-state and two-client relay tests
+npm run test:watch # re-run the tests while editing
+npm run build      # production build
+npm start          # run the built app locally
+npm audit          # dependency security audit
 ```
+
+### Checking a live two-client game
+
+Automated tests cover the relay rules with two simulated clients (see `tests/`), but a real check still needs two browsers:
+
+1. Deploy (or run locally) with Pusher credentials, then open KnightClub in two browsers or two devices.
+2. Exchange the friend codes once, accept the friend request, and start a game with a short clock.
+3. Play to a real checkmate (Scholar's mate works: `e4 e5 Bc4 Nc6 Qh5 Nf6 Qxf7#`). Both screens must show **Checkmate**, the same winner, the red checking arrows, the final-result card, and the rematch/replay controls.
+4. Check the resilience paths: reload one tab mid-game (the restored snapshot is re-read from its board), background it during the mating move, and let a relay hiccup happen—the tab requests a fresh snapshot when it reconnects or wakes up.
+5. Try a finish while the opponent is sending a draw offer or takeback at the same moment. Versions can collide; the final result still wins and both clients converge on the same version.
 
 ## Project structure
 
@@ -88,6 +103,9 @@ npm audit        # dependency security audit
 - `components/ChessBoard.tsx` — interactive board, legal-move indicators, and checkmate arrows.
 - `app/api/pusher/auth/route.ts` — Vercel-compatible HMAC auth for owner inbox, presence, and random match channels.
 - `app/api/pusher/trigger/route.ts` — validates a short-lived sender-code signature and forwards an inbox event through Pusher without storing it.
+- `lib/chess-state.ts` — pure game-state helpers: reading a result off a FEN, correcting stale snapshots, deciding whether a relayed snapshot is applied, and deriving checkmate marks.
 - `lib/types.ts` — local and transient game types.
+- `tests/chess-state.test.ts` — result inference, snapshot correction and relay-decision rules.
+- `tests/two-client-sync.test.ts` — two simulated clients exchanging snapshots until they converge on the same final result.
 
 There are deliberately no Supabase files, migrations, or database dependencies.
