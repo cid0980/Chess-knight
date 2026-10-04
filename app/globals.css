@@ -776,7 +776,6 @@ a { color: inherit; text-decoration: none; }
 }
 
 /* Zero-database realtime additions */
-.sidebar-settings-label { margin-top: 25px; }
 .live-dot-offline { background: #d49b54; box-shadow: 0 0 0 3px rgba(212,155,84,.12); }
 .quick-time-control { min-height: 47px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 10px; border: 1px solid var(--line); border-radius: 9px; color: #78867c; background: #fff; font-size: 9px; }
 .quick-time-control > span { display: inline-flex; align-items: center; gap: 6px; }
@@ -821,4 +820,49 @@ a { color: inherit; text-decoration: none; }
   .local-lock-grid { grid-template-columns: 1fr; }
   .friend-filter-total { display: none; }
   .your-friend-code { align-items: flex-start; flex-direction: column; }
+}
+/* Mobile navigation and install-card refinements. Imported after the base stylesheet. */
+.nav-section-divider { width: 100%; height: 1px; margin: 8px 0 5px; background: rgba(255,255,255,.09); }
+.install-recommendation { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin: 0 0 18px; padding: 11px 12px; border: 1px solid #dce8de; border-radius: 11px; background: #f7fbf7; box-shadow: 0 4px 14px rgba(32,70,43,.035); }
+.install-app-icon { width: 34px; height: 34px; flex: 0 0 34px; display: grid; place-items: center; border: 1px solid #d9e7dc; border-radius: 9px; color: #3c7550; background: #edf5ee; }
+.install-message { min-width: 135px; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.install-message strong { color: #344a3a; font-size: 10px; font-weight: 700; }
+.install-message small { color: #7d8e80; font-size: 8px; line-height: 1.45; }
+.install-action { min-height: 32px; padding: 0 10px; color: #3e704d; font-size: 9px; white-space: nowrap; }
+.install-dismiss { width: 28px; height: 28px; flex: 0 0 28px; border-radius: 7px; color: #819085; }
+.install-dismiss:hover { background: #eaf2eb; }
+.install-steps { flex: 1 0 100%; display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 0 0 1px 43px; color: #647469; font-size: 9px; line-height: 1.55; }
+.install-steps strong { color: #3e6648; }
+.install-steps svg { flex: 0 0 auto; color: #4d805d; }
+
+@media (max-width: 760px) {
+  .app-shell { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+  .sidebar { display: flex; height: calc(64px + env(safe-area-inset-bottom)); padding: 5px 6px max(5px, env(safe-area-inset-bottom)); }
+  .side-nav { width: min(100%, 480px); display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); justify-items: stretch; gap: 3px; margin: 0 auto; }
+  .nav-section-divider { display: none; }
+  .nav-link { width: 100%; min-width: 0; height: 50px; min-height: 48px; gap: 3px; padding: 3px 1px 2px; font-size: 8px; line-height: 1.1; }
+  .nav-link > span:not(.nav-count):not(.nav-badge) { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nav-link > svg:first-child { flex: 0 0 auto; }
+  .main-shell { min-height: calc(100dvh - 64px); }
+  .toast { bottom: calc(72px + env(safe-area-inset-bottom)); }
+  .install-recommendation { gap: 7px; padding: 9px; }
+  .install-message { min-width: 100px; }
+  .install-action { padding: 0 8px; }
+  .install-steps { margin-left: 40px; }
+  .nav-link, button { touch-action: manipulation; }
+}
+
+@media (max-width: 520px) {
+  .app-shell { padding-bottom: calc(61px + env(safe-area-inset-bottom)); }
+  .sidebar { height: calc(61px + env(safe-area-inset-bottom)); grid-template-columns: repeat(5, minmax(0, 1fr)); padding-right: 4px; padding-left: 4px; }
+  .nav-link { height: 48px; min-height: 48px; font-size: 7.5px; }
+  .nav-link > svg:first-child { width: 18px; height: 18px; }
+  .main-shell { min-height: calc(100dvh - 61px); }
+  .install-recommendation { gap: 6px; padding: 8px; }
+  .install-app-icon { width: 31px; height: 31px; flex-basis: 31px; }
+  .install-message { min-width: 95px; }
+  .install-message small { font-size: 7.5px; }
+  .install-action { min-height: 32px; font-size: 8px; }
+  .install-dismiss { width: 26px; height: 26px; flex-basis: 26px; }
+  .install-steps { margin-left: 37px; font-size: 8px; }
 }

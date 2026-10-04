@@ -6,7 +6,7 @@ import {
   AlertTriangle, ArrowLeft, ArrowRight, Bell, Check, CheckCheck, ChevronDown, ChevronRight,
   Clock3, Copy, Crown, Flag, Handshake, History, Inbox, KeyRound, LoaderCircle, LockKeyhole,
   MessageCircle, MoveUpRight, Play, Plus, Radio, RotateCcw, Search, Send, Settings, Shield,
-  Sparkles, Swords, Timer, Trophy, UserPlus, UsersRound, Volume2, VolumeX, Wifi, WifiOff, X,
+  Share2, Smartphone, Sparkles, Swords, Timer, Trophy, UserPlus, UsersRound, Volume2, VolumeX, Wifi, WifiOff, X,
 } from 'lucide-react';
 import { Chess, type Square } from 'chess.js';
 import ChessBoard, { type BoardArrow } from '@/components/ChessBoard';
@@ -326,6 +326,11 @@ export default function ChessClubApp() {
   const connected = connectionState === 'connected';
   const incomingCount = incomingChallenges.length + friendRequests.filter((request) => request.direction === 'incoming').length;
   const onlineFriendCount = friends.filter((friend) => onlinePublicIds.has(friend.public_id)).length;
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== 'production' || !('serviceWorker' in navigator)) return;
+    void navigator.serviceWorker.register('/sw.js').catch(() => { /* Install remains available through browser menus. */ });
+  }, []);
 
   useEffect(() => { profileRef.current = profile; }, [profile]);
   useEffect(() => { friendsRef.current = friends; }, [friends]);
@@ -1011,9 +1016,9 @@ export default function ChessClubApp() {
           <NavButton active={activeTab === 'friends'} icon={<UsersRound size={16} />} label="Friends" count={friends.length} onClick={() => setTab('friends')} />
           <NavButton active={activeTab === 'inbox'} icon={<Inbox size={16} />} label="Inbox" badge={incomingCount} onClick={() => setTab('inbox')} />
           <NavButton active={activeTab === 'history'} icon={<History size={16} />} label="Session games" onClick={() => setTab('history')} />
+          <span className="nav-section-divider" aria-hidden="true" />
+          <NavButton active={activeTab === 'settings'} icon={<Settings size={16} />} label="Settings" onClick={() => setTab('settings')} />
         </nav>
-        <div className="sidebar-label sidebar-settings-label">PREFERENCES</div>
-        <nav className="side-nav"><NavButton active={activeTab === 'settings'} icon={<Settings size={16} />} label="Settings" onClick={() => setTab('settings')} /></nav>
         <div className="sidebar-spacer" />
         <div className="sidebar-live-card"><span className={connected ? 'live-dot' : 'live-dot live-dot-offline'} /><div><strong>{runtime === 'live' ? (connected ? 'Realtime connected' : 'Connecting to relay') : 'Local-only preview'}</strong><small>{runtime === 'live' ? 'Pusher Channels · no database' : 'Configure Pusher for online play'}</small></div>{connected ? <Wifi size={14} /> : <WifiOff size={14} />}</div>
         {profile && <button className="account-row" onClick={() => setTab('settings')}><span className="avatar avatar-sidebar">{initials(profile.display_name)}</span><span className="account-meta"><strong>{profile.display_name}</strong><small>Browser profile</small></span><Settings size={14} /></button>}
@@ -1092,6 +1097,68 @@ function NavButton({ active, icon, label, count, badge, onClick }: { active: boo
   return <button className={`nav-link${active ? ' nav-active' : ''}`} onClick={onClick}>{icon}<span>{label}</span>{badge ? <span className="nav-badge">{badge}</span> : count !== undefined ? <span className="nav-count">{count}</span> : null}<ChevronRight className="nav-chevron" size={13} /></button>;
 }
 
+type InstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+};
+
+function InstallRecommendation() {
+  const [visible, setVisible] = useState(false);
+  const [isIos, setIsIos] = useState(false);
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+  const [showSteps, setShowSteps] = useState(false);
+  useEffect(() => {
+    const nav = navigator as Navigator & { standalone?: boolean };
+    const installed = window.matchMedia('(display-mode: standalone)').matches || nav.standalone === true;
+    if (installed) return;
+    const agent = navigator.userAgent.toLowerCase();
+    const ios = /iphone|ipad|ipod/.test(agent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    setIsIos(ios);
+    try { if (sessionStorage.getItem('knightclub.install-dismissed') === '1') return; } catch { /* Install hint can still be shown. */ }
+    setVisible(true);
+    const onBeforeInstall = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as InstallPromptEvent);
+      setVisible(true);
+    };
+    const onInstalled = () => { setVisible(false); setInstallPrompt(null); };
+    window.addEventListener('beforeinstallprompt', onBeforeInstall);
+    window.addEventListener('appinstalled', onInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', onBeforeInstall);
+      window.removeEventListener('appinstalled', onInstalled);
+    };
+  }, []);
+
+  async function installOrShowSteps() {
+    if (!installPrompt) { setShowSteps((value) => !value); return; }
+    try {
+      await installPrompt.prompt();
+      const choice = await installPrompt.userChoice;
+      setInstallPrompt(null);
+      if (choice.outcome === 'accepted') setVisible(false);
+      else setShowSteps(true);
+    } catch {
+      setInstallPrompt(null);
+      setShowSteps(true);
+    }
+  }
+
+  function dismiss() {
+    setVisible(false);
+    try { sessionStorage.setItem('knightclub.install-dismissed', '1'); } catch { /* Ignore storage errors. */ }
+  }
+
+  if (!visible) return null;
+  return <aside className="install-recommendation" aria-label="Install KnightClub">
+    <span className="install-app-icon" aria-hidden="true"><Smartphone size={17} /></span>
+    <div className="install-message"><strong>Install KnightClub</strong><small>Add a full-screen shortcut; online games still need internet.</small></div>
+    <button className="button button-soft install-action" aria-expanded={!installPrompt && showSteps} aria-controls="install-instructions" onClick={() => void installOrShowSteps()}>{installPrompt ? 'Install' : 'How to add'}</button>
+    <button className="icon-button install-dismiss" aria-label="Dismiss install suggestion" onClick={dismiss}><X size={14} /></button>
+    {showSteps && <p className="install-steps" id="install-instructions">{isIos ? <>In Safari, tap <Share2 size={12} /> <strong>Share</strong>, then choose <strong>Add to Home Screen</strong>.</> : <>Open your browser menu <strong>⋮</strong> or <strong>Share</strong>, then choose <strong>Install app</strong> or <strong>Add to Home screen</strong>.</>}</p>}
+  </aside>;
+}
+
 function Dashboard({ profile, runtime, connected, friends, onlinePublicIds, incomingChallenges, games, currentGame, selectedTime, onSetTime, onStartPractice, onResume, onOpenFriends, onOpenInbox, onOpenHistory, onAcceptChallenge, onChallenge }: {
   profile: PlayerProfile | null; runtime: Runtime; connected: boolean; friends: FriendRecord[]; onlinePublicIds: Set<string>;
   incomingChallenges: PendingChallenge[]; games: GameRecord[]; currentGame: GameRecord | null; selectedTime: number;
@@ -1105,6 +1172,7 @@ function Dashboard({ profile, runtime, connected, friends, onlinePublicIds, inco
     <div className="page-heading-row"><div><span className="eyebrow">YOUR PRIVATE CHESS CLUB</span><h1>Good to see you, {profile?.display_name.split(' ')[0] || 'player'}.</h1><p className="muted">Settle in for a thoughtful game, right here in your browser.</p></div><button className="button button-outline" onClick={onOpenFriends}><UserPlus size={14} /> Add a friend</button></div>
     {runtime === 'local' && <div className="preview-notice"><AlertTriangle size={15} /><span><strong>Local preview.</strong> The board works now; online challenges need Pusher credentials. No database is used.</span><button onClick={onOpenFriends}>Setup guide <ChevronRight size={12} /></button></div>}
     {!connected && runtime === 'live' && <div className="preview-notice"><WifiOff size={15} /><span><strong>Relay reconnecting.</strong> Friend requests and game moves need both browsers online.</span></div>}
+    <InstallRecommendation />
     <div className="home-grid">
       <div className="home-main-column">
         <section className="hero-card"><div className="hero-content"><div className="hero-kicker"><span className="hero-sparkle">✦</span> YOUR NEXT GAME STARTS HERE</div><h2>A good game is<br />better with friends.</h2><p>Invite someone you know. No accounts, no database—just your board, their board, and a live relay.</p><div className="hero-actions"><button className="button button-cream" onClick={onStartPractice}><Play size={14} /> Practice locally</button><button className="hero-text-button" onClick={onOpenFriends}>Set up friends <ArrowRight size={13} /></button></div></div><div className="hero-art"><span className="hero-orbit orbit-one" /><span className="hero-orbit orbit-two" /><span className="hero-chess-piece">♞</span><span className="hero-art-caption"><i className="hero-art-dot" />{connected ? 'RELAY ONLINE' : 'YOUR BOARD AWAITS'}</span><div className="hero-mini-board">{['♜','♞','♝','♛','♟','♟','♟','♟'].map((piece, index) => <span key={index}>{piece}</span>)}</div></div></section>

@@ -9,14 +9,14 @@ A polished, Vercel-hostable chess club for live games with friends. Friends and 
 - Clocks, takeback requests, draw offers, resign, rematch with swapped colors, and move replay.
 - Checkmate explanation with arrows pointing from checking pieces toward the trapped king.
 - Local board, sound, notification, display-name, and optional browser-lock settings.
-- Responsive Vercel/Next.js app with a small signed-channel authorization route.
+- Responsive, installable PWA for Vercel/Next.js, with mobile install guidance and a lightweight app-shell cache.
 
 ## Zero-database architecture and tradeoffs
 
 - **Browser storage:** profile, friend list, and preferences are in `localStorage`. A current online game snapshot is kept in `sessionStorage` for that tab. There is no server-side player or game record.
 - **Realtime:** Pusher Channels forwards private-channel client events and online presence. Vercel signs channel-authorization requests with an HMAC; it does not store app data.
 - **Both players must be online:** friend requests, challenges, moves, and action requests are live-only. If the recipient is offline, nothing is queued.
-- **No durable inbox, offline push, or saved match history.** Browser notifications can appear only while KnightClub is open and connected. The session-games list is temporary.
+- **No durable inbox, offline push, or saved match history.** Browser notifications can appear only while KnightClub is open and connected. The session-games list is temporary. The PWA caches the app shell/static assets for faster reloads and a basic offline fallback; online games and requests still need internet.
 - **No account/password recovery.** The optional password is a browser-local lock only. Clearing browser data removes the profile, friends, settings, and lock.
 - **Friend codes are bearer invites.** They are high-entropy and should be shared privately. Anyone who has a code can address that player's live inbox.
 - The relay is not an authoritative chess server. Both clients validate moves locally and exchange snapshots over authorized private channels; this is intended for private casual games, not rated or cheat-resistant play. A reconnect can recover from the other player's open tab, but there is no server copy if both players lose their session.
@@ -30,6 +30,16 @@ npm run dev
 ```
 
 Without Pusher credentials, KnightClub opens in local-only mode. You can play both colors on one board and try the chess controls. Add the configuration below for cross-device play.
+
+## Install on a phone or desktop
+
+Use the deployed HTTPS KnightClub URL (Vercel provides HTTPS). The app also shows a small **Install KnightClub** card with browser-specific steps when it is not already installed.
+
+- **Android / Chrome:** open the site, tap the browser menu (`⋮`), then choose **Install app** or **Add to Home screen** and confirm. If Chrome offers an **Install** button in KnightClub, you can use that instead.
+- **iPhone / iPad:** open the site in **Safari**, tap **Share**, choose **Add to Home Screen**, then tap **Add**. iOS does not show the same automatic install prompt as Chrome.
+- **Desktop / Chrome or Edge:** use the install icon in the address bar, if shown, or choose **Install KnightClub** from the browser menu.
+
+The installed shortcut opens in a standalone app-style window. It does not enable offline multiplayer, offline notifications, or durable storage; friend requests and online games still require both players to be connected.
 
 ## Configure Pusher Channels
 
