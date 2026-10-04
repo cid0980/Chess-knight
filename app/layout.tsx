@@ -17,10 +17,13 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: [
-    { media: '(prefers-color-scheme: light)', color: '#f3f4f0' },
-    { media: '(prefers-color-scheme: dark)', color: '#0e1512' },
-  ],
+  // `color-scheme: light dark` also tells Chrome the page handles dark mode
+  // itself, so it stops force-darkening the page (which used to leave the top
+  // bar light while everything else was darkened).
+  colorScheme: 'light dark',
+  // One meta, rewritten by the bootstrap below: the OS status bar always ends
+  // up matching the theme the app actually resolved.
+  themeColor: '#f3f4f0',
   width: 'device-width',
   initialScale: 1,
   viewportFit: 'cover',

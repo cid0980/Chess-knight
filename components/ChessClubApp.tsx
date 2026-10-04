@@ -29,6 +29,7 @@ type RelayChannel = ReturnType<PusherClient['subscribe']>;
 const PROFILE_KEY = 'knightclub:v2:profile';
 const FRIENDS_KEY = 'knightclub:v2:friends';
 const PREFS_KEY = 'knightclub:v2:preferences';
+const NOTIFY_PROMPT_KEY = 'knightclub:v2:notify-prompt';
 const LOCK_KEY = 'knightclub:v2:device-lock';
 const ACTIVE_GAME_KEY = 'knightclub:active-game';
 const PRESENCE_CHANNEL = 'presence-knightclub-v1';
@@ -277,22 +278,66 @@ function unlockMoveAudio() {
   if (audio && audio.state === 'suspended') void audio.resume().catch(() => { /* Audio stays optional. */ });
 }
 
-function playMoveTone(enabled: boolean) {
+function moveAudioReady() {
+  return moveAudioContext?.state === 'running';
+}
+
+/**
+ * Plays one short note. A tick is built from a bright, very fast-decaying tone
+ * plus a low body note, which reads as a wooden click instead of a beep.
+ */
+function tone(audio: AudioContext, options: { frequency: number; sweepTo?: number; type: OscillatorType; gain: number; duration: number; delay?: number }) {
+  const { frequency, sweepTo, type, gain, duration, delay = 0 } = options;
+  const oscillator = audio.createOscillator();
+  const amp = audio.createGain();
+  const start = audio.currentTime + delay;
+  oscillator.type = type;
+  oscillator.frequency.setValueAtTime(frequency, start);
+  if (sweepTo) oscillator.frequency.exponentialRampToValueAtTime(sweepTo, start + duration);
+  amp.gain.setValueAtTime(0.0001, start);
+  amp.gain.exponentialRampToValueAtTime(gain, start + 0.006);
+  amp.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+  oscillator.connect(amp); amp.connect(audio.destination);
+  oscillator.start(start);
+  oscillator.stop(start + duration + 0.03);
+  oscillator.onended = () => { try { amp.disconnect(); } catch { /* Already detached. */ } };
+}
+
+export type MoveSoundKind = 'own' | 'opponent' | 'capture' | 'check' | 'finish';
+
+/**
+ * Move feedback. Your own move and the opponent's move use different pitches so
+ * you can tell whose move it was without looking at the board, and captures,
+ * checks and the end of the game get their own accents.
+ */
+function playMoveTone(enabled: boolean, kind: MoveSoundKind = 'own') {
   if (!enabled) return;
   const audio = sharedAudioContext();
   if (!audio) return;
   const play = () => {
     try {
-      const oscillator = audio.createOscillator();
-      const gain = audio.createGain();
-      oscillator.type = 'sine';
-      oscillator.frequency.value = 540;
-      oscillator.connect(gain); gain.connect(audio.destination);
-      gain.gain.setValueAtTime(0.035, audio.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + 0.07);
-      oscillator.start();
-      oscillator.stop(audio.currentTime + 0.06);
-      oscillator.onended = () => { try { gain.disconnect(); } catch { /* Already detached. */ } };
+      switch (kind) {
+        case 'opponent':
+          tone(audio, { frequency: 760, sweepTo: 620, type: 'triangle', gain: 0.2, duration: 0.08 });
+          tone(audio, { frequency: 230, type: 'sine', gain: 0.1, duration: 0.1 });
+          break;
+        case 'capture':
+          tone(audio, { frequency: 520, sweepTo: 300, type: 'square', gain: 0.13, duration: 0.09 });
+          tone(audio, { frequency: 150, type: 'sine', gain: 0.18, duration: 0.16 });
+          break;
+        case 'check':
+          tone(audio, { frequency: 1046, type: 'triangle', gain: 0.2, duration: 0.09 });
+          tone(audio, { frequency: 1568, type: 'triangle', gain: 0.16, duration: 0.1, delay: 0.09 });
+          break;
+        case 'finish':
+          tone(audio, { frequency: 784, type: 'triangle', gain: 0.18, duration: 0.12 });
+          tone(audio, { frequency: 988, type: 'triangle', gain: 0.18, duration: 0.12, delay: 0.12 });
+          tone(audio, { frequency: 1319, type: 'triangle', gain: 0.2, duration: 0.24, delay: 0.24 });
+          break;
+        default:
+          tone(audio, { frequency: 1180, sweepTo: 900, type: 'triangle', gain: 0.22, duration: 0.07 });
+          tone(audio, { frequency: 320, type: 'sine', gain: 0.12, duration: 0.09 });
+      }
     } catch { /* Audio is optional. */ }
   };
   if (audio.state === 'suspended') {
@@ -300,6 +345,14 @@ function playMoveTone(enabled: boolean) {
     return;
   }
   play();
+}
+
+/** Chooses the accent from the move itself, so a capture or a check sounds like one. */
+function soundKindFor(san: string | undefined, isOpponent: boolean): MoveSoundKind {
+  if (!san) return isOpponent ? 'opponent' : 'own';
+  if (san.includes('#') || san.includes('+')) return 'check';
+  if (san.includes('x')) return 'capture';
+  return isOpponent ? 'opponent' : 'own';
 }
 
 export default function ChessClubApp() {
@@ -339,6 +392,9 @@ export default function ChessClubApp() {
   const [replayOpen, setReplayOpen] = useState(false);
   const [replayIndex, setReplayIndex] = useState(0);
   const [resignConfirm, setResignConfirm] = useState(false);
+  const [notifyOpen, setNotifyOpen] = useState(false);
+  const [notifyPromptOpen, setNotifyPromptOpen] = useState(false);
+  const notifyRef = useRef<HTMLDivElement | null>(null);
   const pusherRef = useRef<PusherClient | null>(null);
   const currentGameRef = useRef<GameRecord | null>(null);
   const profileRef = useRef<PlayerProfile | null>(null);
@@ -350,7 +406,11 @@ export default function ChessClubApp() {
 
   const liveConfigured = Boolean(process.env.NEXT_PUBLIC_PUSHER_KEY && process.env.NEXT_PUBLIC_PUSHER_CLUSTER);
   const connected = connectionState === 'connected';
-  const incomingCount = incomingChallenges.length + friendRequests.filter((request) => request.direction === 'incoming').length;
+  const notificationsAvailable = typeof Notification !== 'undefined';
+  const notificationsGranted = notificationsAvailable && Notification.permission === 'granted';
+  const notificationsDenied = notificationsAvailable && Notification.permission === 'denied';
+  const incomingFriendRequests = friendRequests.filter((request) => request.direction === 'incoming');
+  const incomingCount = incomingChallenges.length + incomingFriendRequests.length;
   const onlineFriendCount = friends.filter((friend) => onlinePublicIds.has(friend.public_id)).length;
 
   useEffect(() => {
@@ -457,10 +517,10 @@ export default function ChessClubApp() {
   useEffect(() => {
     // Audio can only be unlocked from a real gesture, so do it on the first
     // interaction instead of when the first relayed move arrives.
-    const unlock = () => unlockMoveAudio();
-    window.addEventListener('pointerdown', unlock, { once: true, passive: true });
-    window.addEventListener('keydown', unlock, { once: true });
-    window.addEventListener('touchstart', unlock, { once: true, passive: true });
+    const unlock = () => { if (!moveAudioReady()) unlockMoveAudio(); };
+    window.addEventListener('pointerdown', unlock, { passive: true });
+    window.addEventListener('keydown', unlock);
+    window.addEventListener('touchstart', unlock, { passive: true });
     const onVisibility = () => { if (document.visibilityState === 'visible') unlockMoveAudio(); };
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
@@ -647,7 +707,9 @@ export default function ChessClubApp() {
       setGames((previous) => upsertGame(previous, applied));
       setSelectedSquare(null); setLegalTargets([]); setPromotion(null);
       if (applied.status !== 'active') setQueuedPremove(null);
-      if (preferencesRef.current.sound && application.sound) playMoveTone(true);
+      if (preferencesRef.current.sound && application.sound) {
+        playMoveTone(true, applied.status === 'active' ? soundKindFor(applied.last_move?.san, true) : 'finish');
+      }
       if (application.finished) notify(applied.status === 'checkmate' ? 'Checkmate. The game is over.' : 'The game ended in a draw.', 'success');
       if (application.rebroadcast) broadcastSnapshot(applied);
     };
@@ -701,6 +763,34 @@ export default function ChessClubApp() {
   }, [runtime, profile?.id, locked]);
 
   useEffect(() => {
+    // Offer browser alerts once per browser after the local profile is ready.
+    // Permission itself is requested by the prompt button, within a real gesture.
+    if (runtime === 'loading' || locked || !notificationsAvailable || Notification.permission !== 'default') return;
+    try {
+      if (localStorage.getItem(NOTIFY_PROMPT_KEY) === '1') return;
+      localStorage.setItem(NOTIFY_PROMPT_KEY, '1');
+    } catch { /* The prompt can still be shown if local storage is unavailable. */ }
+    setNotifyPromptOpen(true);
+  }, [runtime, locked, notificationsAvailable]);
+
+  useEffect(() => {
+    if (!notifyOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (event.target instanceof Node && notifyRef.current?.contains(event.target)) return;
+      setNotifyOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setNotifyOpen(false);
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [notifyOpen]);
+
+  useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 500);
     return () => window.clearInterval(interval);
   }, []);
@@ -732,6 +822,7 @@ export default function ChessClubApp() {
     };
     updateGame(finished);
     if (!game.localOnly) sendGameSnapshot(finished);
+    playMoveTone(preferencesRef.current.sound, 'finish');
     notify(status === 'checkmate' ? 'Checkmate. The game is over.' : status === 'draw' ? 'The game ended in a draw.' : 'Game finished.', 'success');
   }, [notify, sendGameSnapshot, updateGame]);
 
@@ -866,7 +957,7 @@ export default function ChessClubApp() {
       moves: [...(game.moves || []), move],
     };
     setSelectedSquare(null); setLegalTargets([]); setPromotion(null); setQueuedPremove(null);
-    playMoveTone(preferencesRef.current.sound);
+    playMoveTone(preferencesRef.current.sound, status === 'active' ? soundKindFor(played.san, false) : 'finish');
     updateGame(updated);
     if (!game.localOnly && !sendGameSnapshot(updated)) notify('Move saved on this device, but the relay is reconnecting. The board will sync when it returns.', 'error');
     if (status === 'checkmate') notify('Checkmate. Attack lines are marked on the board.', 'success');
@@ -1094,6 +1185,8 @@ export default function ChessClubApp() {
   }
 
   async function enableNotifications() {
+    setNotifyPromptOpen(false);
+    try { localStorage.setItem(NOTIFY_PROMPT_KEY, '1'); } catch { /* Notifications can still be enabled in memory. */ }
     if (typeof Notification === 'undefined') { notify('This browser does not support notifications.', 'error'); return; }
     const permission = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission;
     if (permission === 'granted') { setPreferences((value) => ({ ...value, notifications: true })); notify('Notifications enabled for this open browser session.', 'success'); }
@@ -1148,10 +1241,42 @@ export default function ChessClubApp() {
       <div className="main-shell">
         <header className="topbar">
           <div className="breadcrumb"><span>KnightClub</span><ChevronRight size={12} /><strong>{activeTab === 'play' && activeView === 'game' ? 'Game room' : getInitialTabTitle()}</strong></div>
-          <div className="topbar-right"><span className={`connection-pill ${connected ? '' : 'connection-offline'}`}><i className="connection-dot" />{runtime === 'live' ? connectionState : 'Local mode'}</span><button className="icon-button topbar-bell" aria-label="Open inbox" onClick={() => setTab('inbox')}><Bell size={16} />{incomingCount > 0 && <i className="bell-dot" />}</button>{profile && <button className="topbar-profile" onClick={() => setTab('settings')}><span className="avatar avatar-top">{initials(profile.display_name)}</span><span>{profile.display_name}</span><ChevronDown size={13} /></button>}</div>
+          <div className="topbar-right"><span className={`connection-pill ${connected ? '' : 'connection-offline'}`}><i className="connection-dot" />{runtime === 'live' ? connectionState : 'Local mode'}</span><div className="topbar-notify" ref={notifyRef}>
+            <button type="button" className="icon-button topbar-bell" aria-label={incomingCount ? `Notifications, ${incomingCount} pending` : 'Notifications'} aria-expanded={notifyOpen} aria-haspopup="dialog" onClick={() => setNotifyOpen((open) => !open)}><Bell size={16} />{incomingCount > 0 && <i className="bell-dot" />}</button>
+            {notifyOpen && <div className="notify-popover" role="dialog" aria-label="Notifications">
+              <div className="notify-head"><Bell size={14} /><strong>Notifications</strong></div>
+              {incomingChallenges.map((challenge) => <div className="notify-row" key={`challenge-${challenge.id}`}>
+                <span className="notify-row-icon"><Swords size={14} /></span>
+                <span className="notify-row-copy"><strong>{challenge.from.display_name} challenged you</strong><small>Game challenge · {timeControlLabel(challenge.game)}</small></span>
+              </div>)}
+              {incomingFriendRequests.map((request) => <div className="notify-row" key={`friend-${request.id}`}>
+                <span className="notify-row-icon"><UserPlus size={14} /></span>
+                <span className="notify-row-copy"><strong>{request.other_player.display_name} wants to connect</strong><small>{onlinePublicIds.has(request.other_player.public_id) ? 'Friend request · online now' : 'Friend request · may have gone offline'}</small></span>
+              </div>)}
+              {incomingCount === 0 && <div className="notify-empty">You’re all caught up. New live requests will appear here.</div>}
+              {notificationsAvailable && <div className="notify-row">
+                <span className={`notify-row-icon${notificationsGranted ? '' : ' notify-row-icon-muted'}`}><Bell size={13} /></span>
+                <span className="notify-row-copy"><strong>{notificationsGranted ? 'Browser alerts are on' : notificationsDenied ? 'Browser alerts are blocked' : 'Browser alerts are off'}</strong><small>{notificationsGranted ? 'Live requests can notify you while the page is in the background.' : notificationsDenied ? 'Change this site’s notification permission in your browser settings.' : 'Use Settings to allow alerts for live requests.'}</small></span>
+              </div>}
+              <button type="button" className="notify-footer" onClick={() => { setNotifyOpen(false); setTab('inbox'); }}><Inbox size={13} /> Open inbox <ArrowRight size={13} /></button>
+            </div>}
+          </div>{profile && <button className="topbar-profile" onClick={() => setTab('settings')}><span className="avatar avatar-top">{initials(profile.display_name)}</span><span>{profile.display_name}</span><ChevronDown size={13} /></button>}</div>
         </header>
 
         <section className="page-content">
+          {notifyPromptOpen && notificationsAvailable && !notificationsGranted && !notificationsDenied && (
+            <div className="notify-prompt" role="status">
+              <span className="notify-prompt-icon"><Bell size={16} /></span>
+              <div className="notify-prompt-copy">
+                <strong>Stay in the game</strong>
+                <p>Allow browser alerts for live challenges and friend requests while KnightClub is open in the background.</p>
+              </div>
+              <div className="notify-prompt-actions">
+                <button type="button" className="button button-primary button-compact" onClick={() => { void enableNotifications(); }}><Bell size={12} /> Enable alerts</button>
+                <button type="button" className="button button-outline button-compact" onClick={() => setNotifyPromptOpen(false)}>Not now</button>
+              </div>
+            </div>
+          )}
           {activeTab === 'play' && activeView === 'game' && currentGame && profile ? (
             <GameRoom
               game={currentGame} player={profile} opponent={opponent!} boardFen={boardFen} mate={mate}
@@ -1370,15 +1495,15 @@ function SettingsPage({ profile, runtime, connected, preferences, onPreferences,
   return <><div className="page-heading-row"><div><span className="eyebrow">YOUR KNIGHTCLUB</span><h1>Settings</h1><p className="muted">Everything here stays in this browser unless it’s a live game event.</p></div><span className="connection-pill"><i className="connection-dot" />{connected ? 'Relay online' : runtime === 'live' ? 'Relay reconnecting' : 'Local-only mode'}</span></div>
     <div className="settings-layout"><div className="settings-main">
       <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><UsersRound size={15} /></span><div><h2>Browser profile</h2><p>No account, email, or server-side profile.</p></div></div><form className="settings-form" onSubmit={onSaveName}><label><span>Display name</span><input value={displayName} onChange={(event) => onDisplayName(event.target.value)} maxLength={32} placeholder="How friends see you" /></label><label><span>Username</span><input value={profile?.username || ''} readOnly /></label><div className="settings-form-actions"><small>Saved to this device only.</small><button className="button button-primary button-compact" type="submit"><Check size={12} /> Save name</button></div></form><div className="your-friend-code"><div><small>YOUR ONE-TIME FRIEND CODE</small><strong>{profile?.friend_code}</strong><span>Share privately with someone you want to add.</span></div><button className="button button-outline button-compact" onClick={onCopyCode}><Copy size={12} /> Copy code</button></div></section>
-      <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><Settings size={15} /></span><div><h2>Appearance, board & sound</h2><p>These preferences are stored in local browser storage.</p></div></div><div className="setting-select-row"><span><strong>Appearance</strong><small>Follow this device or pin a theme</small></span><div className="appearance-options" role="group" aria-label="Appearance">{([['system', 'System', Monitor], ['light', 'Light', Sun], ['dark', 'Dark', Moon]] as const).map(([value, label, Icon]) => <button key={value} type="button" aria-pressed={preferences.theme === value} className={`appearance-choice${preferences.theme === value ? ' appearance-choice-active' : ''}`} onClick={() => onPreferences((current) => ({ ...current, theme: value }))}><Icon size={12} />{label}</button>)}</div></div><div className="setting-select-row"><span><strong>Board theme</strong><small>Choose a board palette</small></span><div className="theme-options"><button className={`theme-swatch${preferences.boardTheme === 'classic' ? ' theme-swatch-active' : ''}`} aria-label="Classic board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'classic' }))}><i /></button><button className={`theme-swatch theme-swatch-wood${preferences.boardTheme === 'wood' ? ' theme-swatch-active' : ''}`} aria-label="Wood board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'wood' }))}><i /></button><button className={`theme-swatch theme-swatch-slate${preferences.boardTheme === 'slate' ? ' theme-swatch-active' : ''}`} aria-label="Slate board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'slate' }))}><i /></button></div></div><SettingToggle title="Board coordinates" detail="Show file and rank labels around the board" checked={preferences.coordinates} onChange={() => onPreferences((current) => ({ ...current, coordinates: !current.coordinates }))} /><SettingToggle title="Move sounds" detail="Play a short tone after a move" checked={preferences.sound} onChange={() => onPreferences((current) => ({ ...current, sound: !current.sound }))} /></section>
+      <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><Settings size={15} /></span><div><h2>Appearance, board & sound</h2><p>These preferences are stored in local browser storage.</p></div></div><div className="setting-select-row"><span><strong>Appearance</strong><small>Follow this device or pin a theme</small></span><div className="appearance-options" role="group" aria-label="Appearance">{([['system', 'System', Monitor], ['light', 'Light', Sun], ['dark', 'Dark', Moon]] as const).map(([value, label, Icon]) => <button key={value} type="button" aria-pressed={preferences.theme === value} className={`appearance-choice${preferences.theme === value ? ' appearance-choice-active' : ''}`} onClick={() => onPreferences((current) => ({ ...current, theme: value }))}><Icon size={12} />{label}</button>)}</div></div><div className="setting-select-row"><span><strong>Board theme</strong><small>Choose a board palette</small></span><div className="theme-options"><button className={`theme-swatch${preferences.boardTheme === 'classic' ? ' theme-swatch-active' : ''}`} aria-label="Classic board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'classic' }))}><i /></button><button className={`theme-swatch theme-swatch-wood${preferences.boardTheme === 'wood' ? ' theme-swatch-active' : ''}`} aria-label="Wood board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'wood' }))}><i /></button><button className={`theme-swatch theme-swatch-slate${preferences.boardTheme === 'slate' ? ' theme-swatch-active' : ''}`} aria-label="Slate board" onClick={() => onPreferences((current) => ({ ...current, boardTheme: 'slate' }))}><i /></button></div></div><SettingToggle title="Board coordinates" detail="Show file and rank labels around the board" checked={preferences.coordinates} onChange={() => onPreferences((current) => ({ ...current, coordinates: !current.coordinates }))} /><SettingToggle title="Move sounds" detail="A tick for your move, a lower one for your opponent's, plus capture and check accents" checked={preferences.sound} onChange={() => onPreferences((current) => ({ ...current, sound: !current.sound }))} action={<button type="button" className="button button-outline button-compact" onClick={() => { unlockMoveAudio(); playMoveTone(true, 'own'); }}><Volume2 size={12} /> Test</button>} /></section>
       <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><Bell size={15} /></span><div><h2>Notifications</h2><p>Browser notifications work only while this page is open and connected.</p></div></div><SettingToggle title="Incoming challenges" detail="Ask the browser for permission to show live challenge alerts" checked={preferences.notifications} onChange={() => preferences.notifications ? onPreferences((current) => ({ ...current, notifications: false })) : onEnableNotifications()} /><div className="settings-note"><AlertTriangle size={13} />This is not offline push. No service stores or queues notifications while you are away.</div></section>
       <section className="settings-card"><div className="settings-card-heading"><span className="settings-icon"><LockKeyhole size={15} /></span><div><h2>Local device lock</h2><p>Optional browser-only lock; it is not an account password.</p></div></div><form className="password-form" onSubmit={onSaveLock}>{deviceLock && <label className="local-password-field"><span className="field-label">Current local lock</span><input type="password" value={currentPassword} onChange={(event) => onCurrentPassword(event.target.value)} autoComplete="current-password" /></label>}<div className="local-lock-grid"><label className="local-password-field"><span className="field-label">{deviceLock ? 'New password (blank removes lock)' : 'New local password'}</span><input type="password" value={newPassword} onChange={(event) => onNewPassword(event.target.value)} autoComplete="new-password" placeholder="At least 8 characters" /></label><label className="local-password-field"><span className="field-label">Confirm password</span><input type="password" value={confirmPassword} onChange={(event) => onConfirmPassword(event.target.value)} autoComplete="new-password" /></label></div><div className="settings-form-actions"><small>Clearing browser data removes this lock and local profile.</small><button className="button button-outline button-compact" type="submit"><KeyRound size={12} /> {deviceLock ? 'Update local lock' : 'Set local lock'}</button></div></form><div className="settings-note"><Shield size={13} />No password leaves this device. There is no server account, sync, or password recovery.</div></section>
     </div><aside className="settings-side-column"><div className="deployment-card"><span className="deploy-badge"><i className="deploy-badge-dot" /> {runtime === 'live' ? 'LIVE RELAY' : 'VERCEL READY'}</span><h2>Zero-database<br />by design.</h2><p>Vercel hosts the app and a tiny signed-channel authorization route. Pusher forwards live events; it is not used as a database.</p><ul><li><Check size={13} /> Friends & settings stay local</li><li><Check size={13} /> Both players online for requests</li><li><Check size={13} /> No durable inbox or history</li><li><Check size={13} /> No offline push delivery</li></ul><span className="deploy-doc-link">{connected ? 'Connected to Pusher Channels' : 'See README for Pusher setup'}</span></div><div className="privacy-card"><Shield size={15} /><div><strong>Capability-code privacy</strong><p>Your friend code is a secret bearer invite. Share it only with people you trust; anyone who has it can address your live inbox.</p></div></div><div className="privacy-card"><Wifi size={15} /><div><strong>Connection status</strong><p>{connected ? 'Your browser is connected. Direct requests can be exchanged while your friends are online.' : 'The board works locally. Add Pusher credentials and enable client events to play online.'}</p></div></div></aside></div>
   </>;
 }
 
-function SettingToggle({ title, detail, checked, onChange }: { title: string; detail: string; checked: boolean; onChange: () => void }) {
-  return <div className="setting-toggle-row"><span className="toggle-copy"><strong>{title}</strong><small>{detail}</small></span><button type="button" role="switch" aria-checked={checked} className={`toggle-switch${checked ? ' toggle-on' : ''}`} onClick={onChange}><span /></button></div>;
+function SettingToggle({ title, detail, checked, onChange, action }: { title: string; detail: string; checked: boolean; onChange: () => void; action?: React.ReactNode }) {
+  return <div className="setting-toggle-row"><span className="toggle-copy"><strong>{title}</strong><small>{detail}</small></span><span className="setting-toggle-controls">{action}<button type="button" role="switch" aria-checked={checked} className={`toggle-switch${checked ? ' toggle-on' : ''}`} onClick={onChange}><span /></button></span></div>;
 }
 
 function GameRoom({ game, player, opponent, boardFen, mate, theme, coordinates, selectedSquare, legalTargets, premove, disabled, replayOpen, replayIndex, replayTotal, clocks, isMyTurn, gameColor, activeAction, incomingForMe, outgoingForMe, rematchIncoming, rematchWaiting, onBack, onSquareClick, onMoveDrop, onDragSelect, onCancelPremove, onPromotion, promotion, onCancelPromotion, onResign, resignConfirm, onToggleResign, onOfferDraw, onTakeback, onRespondAction, onRematch, onAnswerRematch, onReplay, onReplayIndex, onCloseReplay, onNewGame }: {

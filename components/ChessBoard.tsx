@@ -21,8 +21,12 @@ type Props = {
   onDragSelect?: (square: string) => void;
 };
 
+// Both colours use the filled silhouettes: the CSS stroke is the outline, so a
+// white piece is a solid white shape with a dark border instead of a thin,
+// washed-out outline glyph (and a black piece gets a light rim so it stays
+// readable on dark squares).
 const pieceGlyphs: Record<string, string> = {
-  wk: '♔', wq: '♕', wr: '♖', wb: '♗', wn: '♘', wp: '♙',
+  wk: '♚', wq: '♛', wr: '♜', wb: '♝', wn: '♞', wp: '♟',
   bk: '♚', bq: '♛', br: '♜', bb: '♝', bn: '♞', bp: '♟',
 };
 const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
