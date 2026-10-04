@@ -1,5 +1,5 @@
-const SHELL_CACHE = 'knightclub-shell-v1';
-const STATIC_CACHE = 'knightclub-static-v1';
+const SHELL_CACHE = 'knightclub-shell-v2';
+const STATIC_CACHE = 'knightclub-static-v2';
 const SHELL_FILES = [
   '/',
   '/offline.html',
@@ -15,6 +15,11 @@ self.addEventListener('install', (event) => {
       .then((cache) => cache.addAll(SHELL_FILES))
       .then(() => self.skipWaiting()),
   );
+});
+
+// Let a waiting worker take over as soon as the page asks for it.
+self.addEventListener('message', (event) => {
+  if (event.data === 'knightclub:skip-waiting') self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
